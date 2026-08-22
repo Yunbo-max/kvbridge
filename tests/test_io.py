@@ -138,6 +138,59 @@ def test_capture_evidence_validates_shard_hashes(tmp_path: Path) -> None:
     assert report["shard_hashes_verified"] is True
 
 
+def test_capture_evidence_accepts_prestrided_content_caches(tmp_path: Path) -> None:
+    config_path, calibration_dir = _capture_evidence(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["calibration"]["stride"] = 2
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    problem = make_problem(calibration_pairs=2, tokens=8)
+    records = []
+    for index, pair in enumerate(problem.calibration):
+        path = calibration_dir / f"{index:05}.safetensors"
+        path.unlink()
+        sampled = type(pair)(
+            pair.source.to_content_space().sample_tokens(2),
+            pair.target.to_content_space().sample_tokens(2),
+        )
+        sequence_id = f"synthetic:{index}"
+        save_calibration_shard(path, sampled, sequence_id=sequence_id)
+        records.append({
+            "name": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+            "sequence_id": sequence_id,
+        })
+    manifest_path = calibration_dir / "capture_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({
+        "config_sha256": sha256_file(config_path),
+        "calibration_contract_sha256": calibration_contract_sha256(config_path),
+        "persisted_token_stride": 2,
+        "persisted_keys_are_content": True,
+        "shards": records,
+    })
+    atomic_write_text(manifest_path, json.dumps(manifest) + "\n")
+
+    report = validate_capture_evidence(config_path, calibration_dir)
+
+    assert report["persisted_token_stride"] == 2
+
+
+def test_capture_evidence_rejects_prestrided_position_keys(tmp_path: Path) -> None:
+    config_path, calibration_dir = _capture_evidence(tmp_path)
+    manifest_path = calibration_dir / "capture_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["persisted_token_stride"] = 1
+    manifest["persisted_keys_are_content"] = True
+    atomic_write_text(manifest_path, json.dumps(manifest) + "\n")
+    # A content-space claim alone must not bypass per-shard metadata validation.
+    manifest["persisted_token_stride"] = 2
+    atomic_write_text(manifest_path, json.dumps(manifest) + "\n")
+
+    with pytest.raises(ArtifactError):
+        validate_capture_evidence(config_path, calibration_dir)
+
+
 def test_capture_evidence_rejects_tampered_shard(tmp_path: Path) -> None:
     config_path, calibration_dir = _capture_evidence(tmp_path)
     shard = calibration_dir / "00000.safetensors"

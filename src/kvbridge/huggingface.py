@@ -50,18 +50,21 @@ def model_signature(
     revision: str,
     attention_kind: str = "dense",
 ) -> ModelSignature:
-    config = model.config
+    outer_config = model.config
+    # Multimodal wrappers such as Mistral3 keep the decoder contract under
+    # text_config. KV transfer concerns that decoder, not the vision tower.
+    config = getattr(outer_config, "text_config", outer_config)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
     return ModelSignature(
-        model_id=getattr(config, "_name_or_path", config.model_type),
+        model_id=getattr(outer_config, "_name_or_path", None) or config.model_type,
         revision=revision,
         tokenizer_hash=tokenizer_fingerprint(tokenizer),
         num_layers=config.num_hidden_layers,
         num_kv_heads=kv_heads,
         head_dim=head_dim,
         attention_kind=attention_kind,  # type: ignore[arg-type]
-        architecture=(config.architectures or [config.model_type])[0],
+        architecture=(getattr(outer_config, "architectures", None) or [config.model_type])[0],
     )
 
 
@@ -69,6 +72,12 @@ def _rotary_module(model: Any) -> Any:
     candidates = [
         getattr(getattr(model, "model", None), "rotary_emb", None),
         getattr(getattr(getattr(model, "model", None), "model", None), "rotary_emb", None),
+        getattr(getattr(model, "language_model", None), "rotary_emb", None),
+        getattr(
+            getattr(getattr(model, "model", None), "language_model", None),
+            "rotary_emb",
+            None,
+        ),
     ]
     for candidate in candidates:
         if candidate is not None:
@@ -103,6 +112,10 @@ def _decoder_layers(model: Any) -> Any:
     candidates = [
         getattr(getattr(model, "model", None), "layers", None),
         getattr(getattr(getattr(model, "model", None), "model", None), "layers", None),
+        getattr(getattr(model, "language_model", None), "layers", None),
+        getattr(
+            getattr(getattr(model, "model", None), "language_model", None), "layers", None
+        ),
     ]
     for candidate in candidates:
         if candidate is not None:
@@ -125,6 +138,26 @@ def _canonical_query(output: Any, *, query_heads: int, head_dim: int) -> Tensor:
     if output.ndim == 4 and output.shape[1] == query_heads and output.shape[-1] == head_dim:
         return output
     raise CompatibilityError(f"unsupported query tensor shape: {tuple(output.shape)}")
+
+
+def _apply_query_position_scaling(
+    query: Tensor, position_ids: Tensor, decoder_config: Any
+) -> Tensor:
+    """Apply decoder-specific scaling that occurs after Q RoPE.
+
+    Ministral 3 uses the Llama-4 logarithmic query scale. It is one below the
+    original context limit, but omitting it corrupts attention diagnostics for
+    longer contexts even when K/V mapping itself is correct.
+    """
+    rope = getattr(decoder_config, "rope_parameters", None) or {}
+    beta = rope.get("llama_4_scaling_beta")
+    original = rope.get("original_max_position_embeddings")
+    if beta is None or original is None:
+        return query
+    scale = 1 + float(beta) * torch.log(
+        1 + torch.floor(position_ids.to(device=query.device, dtype=torch.float32) / int(original))
+    )
+    return query * scale[:, None, :, None].to(query.dtype)
 
 
 @torch.inference_mode()
@@ -171,11 +204,12 @@ def capture_cache_with_queries(
         attention_mask = attention_mask.to(device)
     position_ids = attention_mask.long().cumsum(-1) - 1
     position_ids.masked_fill_(attention_mask == 0, 0)
-    query_heads = int(model.config.num_attention_heads)
+    decoder_config = getattr(model.config, "text_config", model.config)
+    query_heads = int(decoder_config.num_attention_heads)
     head_dim = int(
-        getattr(model.config, "head_dim", model.config.hidden_size // query_heads)
+        getattr(decoder_config, "head_dim", decoder_config.hidden_size // query_heads)
     )
-    raw_queries: list[Tensor | None] = [None] * int(model.config.num_hidden_layers)
+    raw_queries: list[Tensor | None] = [None] * int(decoder_config.num_hidden_layers)
     handles = []
     for layer_index, layer in enumerate(_decoder_layers(model)):
         attention = layer.self_attn
@@ -207,7 +241,11 @@ def capture_cache_with_queries(
     if any(query is None for query in raw_queries):
         raise CompatibilityError("not every target layer emitted a query tensor")
     rotary = capture_rotary_factors(model, position_ids)
-    queries = tuple(rotary.apply(query) for query in raw_queries if query is not None)
+    queries = tuple(
+        _apply_query_position_scaling(rotary.apply(query), position_ids, decoder_config)
+        for query in raw_queries
+        if query is not None
+    )
     layers = _legacy_layers(outputs.past_key_values)
     cache = KVCache([layer[0] for layer in layers], [layer[1] for layer in layers], rotary)
     return HFCapture(cache=cache, queries=queries, logits=outputs.logits)

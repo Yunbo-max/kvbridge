@@ -10,6 +10,7 @@ import hashlib
 import json
 import platform
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,16 @@ def main() -> int:
     config = ExperimentConfig.load(args.config)
     plan = build_scale_plan(config)
     print(json.dumps(plan.to_dict(), indent=2))
+    max_features = (
+        min(config.fit.top_k, config.source.num_layers)
+        * config.source.num_kv_heads
+        * config.source.head_dim
+    )
+    if plan.observations <= max_features:
+        raise RuntimeError(
+            "ridge calibration is underdetermined: "
+            f"observations={plan.observations} must exceed feature dimension={max_features}"
+        )
     if not args.execute:
         print("Dry-run only. Re-run with --execute after calibration capture completes.")
         return 0
@@ -64,6 +75,14 @@ def main() -> int:
     manifest_path = args.calibration_dir / "capture_manifest.json"
     capture_report = validate_capture_evidence(args.config, args.calibration_dir)
     capture = _load_manifest(manifest_path)
+    persisted_stride = int(capture.get("persisted_token_stride", 1))
+    if persisted_stride not in {1, config.fit.token_stride}:
+        raise RuntimeError(
+            "persisted calibration stride must be 1 or equal the configured token stride"
+        )
+    effective_fit = (
+        replace(config.fit, token_stride=1) if persisted_stride > 1 else config.fit
+    )
     shard_paths = sorted(args.calibration_dir.glob("*.safetensors"))
     if len(shard_paths) != config.calibration_sequences:
         raise RuntimeError(
@@ -84,7 +103,7 @@ def main() -> int:
         torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     mapper = fit_mapper(
-        calibration_shard_factory(args.calibration_dir), source, target, config.fit
+        calibration_shard_factory(args.calibration_dir), source, target, effective_fit
     )
     elapsed_seconds = time.perf_counter() - started
     raw_config = json.loads(args.config.read_text(encoding="utf-8"))
@@ -101,6 +120,8 @@ def main() -> int:
         "calibration_shards": len(shard_paths),
         "calibration_bytes": calibration_bytes,
         "calibration_data_passes": plan.calibration_data_passes,
+        "persisted_token_stride": persisted_stride,
+        "effective_fit_token_stride": effective_fit.token_stride,
         "estimated_calibration_bytes_read": calibration_bytes
         * plan.calibration_data_passes,
         "elapsed_seconds": elapsed_seconds,

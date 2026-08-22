@@ -75,6 +75,7 @@ def _select_layers(
     device: torch.device,
 ) -> tuple[list[list[int]], list[list[float]]]:
     """Select source layers by key/value, head-averaged single-source R²."""
+    matched_heads = source.num_kv_heads == target.num_kv_heads
     selected: list[list[int]] = [[] for _ in range(target.num_layers)]
     all_scores: list[list[float]] = [[] for _ in range(target.num_layers)]
     block_size = config.selection_target_layer_block_size
@@ -83,10 +84,14 @@ def _select_layers(
         accumulators: dict[tuple[int, int, int, str], RidgeAccumulator] = {}
         for target_layer in block:
             for source_layer in range(source.num_layers):
-                for head in range(target.num_kv_heads):
+                selection_heads = range(target.num_kv_heads) if matched_heads else range(1)
+                for head in selection_heads:
                     for kind in ("key", "value"):
                         accumulators[(target_layer, source_layer, head, kind)] = RidgeAccumulator(
-                            source.head_dim, target.head_dim, dtype=dtype, device=device
+                            source.head_dim if matched_heads else source.num_kv_heads * source.head_dim,
+                            target.head_dim if matched_heads else target.num_kv_heads * target.head_dim,
+                            dtype=dtype,
+                            device=device,
                         )
         pair_count = 0
         for pair_index, raw_pair in enumerate(_iterate(examples)):
@@ -95,14 +100,29 @@ def _select_layers(
             pair_count += 1
             for target_layer in block:
                 for source_layer in range(source.num_layers):
-                    for head in range(target.num_kv_heads):
+                    selection_heads = range(target.num_kv_heads) if matched_heads else range(1)
+                    for head in selection_heads:
+                        source_key = (
+                            flatten_head_tokens(pair.source.keys[source_layer], head)
+                            if matched_heads else flatten_tokens(pair.source.keys[source_layer])
+                        )
+                        target_key = (
+                            flatten_head_tokens(pair.target.keys[target_layer], head)
+                            if matched_heads else flatten_tokens(pair.target.keys[target_layer])
+                        )
+                        source_value = (
+                            flatten_head_tokens(pair.source.values[source_layer], head)
+                            if matched_heads else flatten_tokens(pair.source.values[source_layer])
+                        )
+                        target_value = (
+                            flatten_head_tokens(pair.target.values[target_layer], head)
+                            if matched_heads else flatten_tokens(pair.target.values[target_layer])
+                        )
                         accumulators[(target_layer, source_layer, head, "key")].update(
-                            flatten_head_tokens(pair.source.keys[source_layer], head),
-                            flatten_head_tokens(pair.target.keys[target_layer], head),
+                            source_key, target_key,
                         )
                         accumulators[(target_layer, source_layer, head, "value")].update(
-                            flatten_head_tokens(pair.source.values[source_layer], head),
-                            flatten_head_tokens(pair.target.values[target_layer], head),
+                            source_value, target_value,
                         )
         if pair_count == 0:
             raise ValueError("at least one calibration pair is required")
@@ -113,7 +133,7 @@ def _select_layers(
                     accumulators[(target_layer, source_layer, head, kind)]
                     .solve(config.selection_alpha)
                     .r2
-                    for head in range(target.num_kv_heads)
+                    for head in (range(target.num_kv_heads) if matched_heads else range(1))
                     for kind in ("key", "value")
                 ]
                 layer_scores.append(sum(scores) / len(scores))
@@ -136,10 +156,6 @@ def fit_mapper(
     """
     config = config or FitConfig()
     source_signature.validate_pair(target_signature, require_matched_kv=config.require_matched_kv)
-    if not config.require_matched_kv:
-        raise NotImplementedError(
-            "unmatched-KV selection is intentionally outside the validated v0.1 path"
-        )
     dtype = torch.float64 if config.accumulation_dtype == "float64" else torch.float32
     device = torch.device(config.accumulation_device)
     if device.type == "cuda" and not torch.cuda.is_available():

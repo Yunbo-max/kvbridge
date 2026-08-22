@@ -228,6 +228,13 @@ def validate_capture_evidence(
         manifest.get("tokens") == config.calibration_tokens,
         "capture manifest token count differs from the config",
     )
+    persisted_stride = manifest.get("persisted_token_stride", 1)
+    _require(
+        isinstance(persisted_stride, int)
+        and persisted_stride in {1, config.token_stride},
+        "persisted token stride must be 1 or match the calibration stride",
+    )
+    expected_persisted_tokens = math.ceil(config.calibration_tokens / persisted_stride)
     _require(
         isinstance(manifest.get("code_revision"), str) and bool(manifest["code_revision"]),
         "capture manifest has no code revision",
@@ -263,6 +270,8 @@ def validate_capture_evidence(
             ) as stream:
                 metadata = stream.metadata() or {}
                 names = set(stream.keys())
+                source_shape = stream.get_slice("source.keys").get_shape()
+                target_shape = stream.get_slice("target.keys").get_shape()
         except (OSError, SafetensorError) as error:
             raise ArtifactError(f"could not inspect calibration shard: {path.name}") from error
         required_tensors = {
@@ -280,6 +289,17 @@ def validate_capture_evidence(
             required_tensors.issubset(names),
             f"calibration shard is missing required tensors: {path.name}",
         )
+        _require(
+            source_shape[3] == expected_persisted_tokens
+            and target_shape[3] == expected_persisted_tokens,
+            f"persisted token count mismatch: {path.name}",
+        )
+        if persisted_stride > 1:
+            _require(
+                metadata.get("source_keys_are_content") == "true"
+                and metadata.get("target_keys_are_content") == "true",
+                f"pre-strided calibration keys must be content-space: {path.name}",
+            )
         if record is not None:
             _require(record.get("bytes") == path.stat().st_size, f"size mismatch: {path.name}")
             _require(
@@ -298,6 +318,7 @@ def validate_capture_evidence(
         "code_revision": manifest["code_revision"],
         "shards": len(shard_paths),
         "shard_hashes_verified": bool(records),
+        "persisted_token_stride": persisted_stride,
     }
 
 
