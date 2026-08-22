@@ -268,6 +268,15 @@ def to_dynamic_cache(cache: KVCache, model: Any) -> Any:
 @torch.inference_mode()
 def suffix_logits_from_cache(model: Any, cache: KVCache, suffix_input_ids: Tensor) -> Tensor:
     """Consume a short suffix against an existing cache and return its logits."""
+    logits, _ = suffix_logits_and_queries_from_cache(model, cache, suffix_input_ids)
+    return logits
+
+
+@torch.inference_mode()
+def suffix_logits_and_queries_from_cache(
+    model: Any, cache: KVCache, suffix_input_ids: Tensor
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    """Consume a suffix and capture its target-model RoPE-applied queries."""
     if suffix_input_ids.ndim != 2 or suffix_input_ids.shape[1] < 1:
         raise ValueError("suffix_input_ids must be rank-2 with at least one token")
     device = model.get_input_embeddings().weight.device
@@ -293,11 +302,41 @@ def suffix_logits_from_cache(model: Any, cache: KVCache, suffix_input_ids: Tenso
         "use_cache": False,
         "return_dict": True,
     }
+    decoder_config = getattr(model.config, "text_config", model.config)
+    query_heads = int(decoder_config.num_attention_heads)
+    head_dim = int(
+        getattr(decoder_config, "head_dim", decoder_config.hidden_size // query_heads)
+    )
+    raw_queries: list[Tensor | None] = [None] * int(decoder_config.num_hidden_layers)
+    handles = []
+    for layer_index, layer in enumerate(_decoder_layers(model)):
+        query_module = getattr(layer.self_attn, "q_norm", None) or layer.self_attn.q_proj
+
+        def capture_query(
+            _module: Any, _inputs: tuple[Any, ...], output: Any, *, index: int = layer_index
+        ) -> None:
+            raw_queries[index] = _canonical_query(
+                output, query_heads=query_heads, head_dim=head_dim
+            )
+
+        handles.append(query_module.register_forward_hook(capture_query))
     try:
-        outputs = model(cache_position=cache_position, **kwargs)
-    except TypeError:
-        outputs = model(**kwargs)
-    return cast(Tensor, outputs.logits)
+        try:
+            outputs = model(cache_position=cache_position, **kwargs)
+        except TypeError:
+            outputs = model(**kwargs)
+    finally:
+        for handle in handles:
+            handle.remove()
+    if any(query is None for query in raw_queries):
+        raise CompatibilityError("not every target layer emitted a suffix query tensor")
+    rotary = capture_rotary_factors(model, position_ids)
+    queries = tuple(
+        _apply_query_position_scaling(rotary.apply(query), position_ids, decoder_config)
+        for query in raw_queries
+        if query is not None
+    )
+    return cast(Tensor, outputs.logits), queries
 
 
 @torch.inference_mode()
